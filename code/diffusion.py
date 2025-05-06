@@ -92,24 +92,27 @@ class ConditionalUNet(nn.Module):
             Block(model_channels*4, model_channels*4, combined_dim)
         ])
 
-        # Middle
+        # Middle (no spatial change)
         self.middle_block1 = Block(
             model_channels*4, model_channels*4, combined_dim)
+        # override transform to preserve spatial dims
+        self.middle_block1.transform = nn.Identity()
         self.middle_block2 = Block(
             model_channels*4, model_channels*4, combined_dim)
+        self.middle_block2.transform = nn.Identity()
 
-        # Upsampling: use full concatenated channel count for each Block
+        # Upsampling: match channels after concatenation of h and skip
         self.ups = nn.ModuleList([
-            # block0: concat h(256) + skip3(256) = 512 in, out 256
+            # block0: in 256+256=512 -> out 256
             Block(model_channels*4 + model_channels*4,
                   model_channels*4, combined_dim, up=True),
-            # block1: concat h(256) + skip2(128) = 384 in, out 128
-            Block(model_channels*4 + model_channels*2,
+            # block1: in 256+256=512 -> out 128
+            Block(model_channels*4 + model_channels*4,
                   model_channels*2, combined_dim, up=True),
-            # block2: concat h(128) + skip1(64)  = 192 in, out 64
-            Block(model_channels*2 + model_channels,
+            # block2: in 128+128=256 -> out 64
+            Block(model_channels*2 + model_channels*2,
                   model_channels, combined_dim, up=True),
-            # block3: concat h(64) + skip0(64)   = 128 in, out 64
+            # block3: in 64+64=128  -> out 64
             Block(model_channels + model_channels,
                   model_channels, combined_dim, up=True)
         ])
@@ -145,42 +148,29 @@ class ConditionalUNet(nn.Module):
 
         # Initial conv
         h = self.conv1(x)
+        # Store skip connections from all down blocks
+        skips = []
 
-        # Store skip connections
-        skips = [h]
-
-        # Downsample
-        for i, down_block in enumerate(self.downs):
+        # Downsample: collect skip features at each level
+        for down_block in self.downs:
             h = down_block(h, temb_cond)
-            if i < len(self.downs) - 1:  # Don't add last layer to skip connections
-                skips.append(h)
+            skips.append(h)
 
         # Middle
         h = self.middle_block1(h, temb_cond)
         h = self.middle_block2(h, temb_cond)
 
         # Upsample with skip connections
+        # skips list: [down0, down1, down2, down3]
         for i, up_block in enumerate(self.ups):
-            # Ensure we're not out of bounds with skip connections
-            skip_idx = len(skips) - i - 1
-            if skip_idx >= 0:
-                skip = skips[skip_idx]
-
-                # Ensure spatial dimensions match
-                if h.shape[2:] != skip.shape[2:]:
-                    h = F.interpolate(h, size=skip.shape[2:], mode='nearest')
-
-                # Ensure batch dimensions match
-                if h.shape[0] != skip.shape[0]:
-                    # Use the smaller batch size
-                    min_batch_size = min(h.shape[0], skip.shape[0])
-                    h = h[:min_batch_size]
-                    skip = skip[:min_batch_size]
-
-                # Concatenate current feature map with skip connection
-                h = torch.cat([h, skip], dim=1)
-
-            # Apply up block
+            # select corresponding skip (from last down backwards)
+            skip = skips[len(skips) - 1 - i]
+            # ensure spatial dims match before concatenation
+            if h.shape[2:] != skip.shape[2:]:
+                h = F.interpolate(h, size=skip.shape[2:], mode='nearest')
+            # concatenate features
+            h = torch.cat([h, skip], dim=1)
+            # apply up block (conv+time+conv+upsample)
             h = up_block(h, temb_cond)
 
         # Final convolution
@@ -247,6 +237,14 @@ class GaussianDiffusion:
 
         x_noisy = self.q_sample(x_0, t, noise)
         predicted_noise = denoise_model(x_noisy, t, condition)
+        # Ensure predicted and target noise have the same spatial dimensions
+        if predicted_noise.shape[2:] != noise.shape[2:]:
+            predicted_noise = F.interpolate(
+                predicted_noise,
+                size=noise.shape[2:],
+                mode='bilinear',
+                align_corners=False
+            )
 
         # Simple MSE loss
         loss = F.mse_loss(predicted_noise, noise)
