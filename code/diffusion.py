@@ -137,11 +137,20 @@ class ConditionalUNet(nn.Module):
         Returns:
             Output tensor of shape [batch_size, out_channels, height, width]
         """
+        # Determine batch size
+        batch_size = x.shape[0]
+
         # Process time embedding
         t_emb = self.time_mlp(t)
+        # Broadcast if needed
+        if t_emb.shape[0] != batch_size:
+            t_emb = t_emb.expand(batch_size, -1)
 
         # Process condition embedding
         c_emb = self.condition_mlp(condition)
+        # Broadcast condition to match batch size
+        if c_emb.shape[0] != batch_size:
+            c_emb = c_emb.expand(batch_size, -1)
 
         # Combine time and condition embeddings
         temb_cond = torch.cat([t_emb, c_emb], dim=1)
@@ -306,6 +315,12 @@ class GaussianDiffusion:
         """
         Generate n_samples from the model
         """
+        # Prepare condition: ensure it's at least 2D
+        if condition.dim() == 1:
+            condition = condition.unsqueeze(0)
+        # Repeat or broadcast condition to match n_samples
+        if condition.shape[0] != n_samples:
+            condition = condition.expand(n_samples, -1)
         return self.p_sample_loop(
             model,
             shape=(n_samples, 3, self.img_size, self.img_size),
