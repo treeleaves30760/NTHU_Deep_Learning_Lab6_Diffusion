@@ -34,7 +34,7 @@ To train the model:
 
 ```bash
 cd code
-python train.py train --train_json train.json --train_image_dir ../iclevr --batch_size 32 --epochs 100 --lr 1e-4 --save_every 10 --generate_samples
+python train.py train --train_json train.json --train_image_dir ../iclevr --batch_size 8 --epochs 400 --lr 1e-4 --save_every 10 --generate_samples
 ```
 
 Arguments:
