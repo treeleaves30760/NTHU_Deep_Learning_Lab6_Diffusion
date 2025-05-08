@@ -66,8 +66,6 @@ class ConditionalUNet(nn.Module):
         self.time_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(time_dim),
             nn.Linear(time_dim, time_dim),
-            nn.ReLU(),
-            nn.Linear(time_dim, time_dim),  # Added extra layer
             nn.ReLU()
         )
 
@@ -77,65 +75,54 @@ class ConditionalUNet(nn.Module):
             nn.Linear(num_classes, condition_dim),
             nn.ReLU(),
             nn.Linear(condition_dim, condition_dim),
-            nn.ReLU(),
-            nn.Linear(condition_dim, condition_dim),  # Added extra layer
             nn.ReLU()
         )
 
         # Combined embedding dimension
         combined_dim = time_dim + condition_dim
 
-        # Initial projection with increased channels
-        self.conv1 = nn.Conv2d(in_channels, model_channels*2, 3, padding=1)
+        # Initial projection
+        self.conv1 = nn.Conv2d(in_channels, model_channels, 3, padding=1)
 
-        # Downsampling with attention
+        # Downsampling
         self.downs = nn.ModuleList([
-            Block(model_channels*2, model_channels*2, combined_dim),
+            Block(model_channels, model_channels, combined_dim),
+            Block(model_channels, model_channels*2, combined_dim),
             Block(model_channels*2, model_channels*4, combined_dim),
-            Block(model_channels*4, model_channels*4, combined_dim),
-            Block(model_channels*4, model_channels*8, combined_dim)
+            Block(model_channels*4, model_channels*4, combined_dim)
         ])
 
-        # Attention layers for downsampling
-        self.down_attentions = nn.ModuleList([
-            nn.MultiheadAttention(model_channels*2, 4),
-            nn.MultiheadAttention(model_channels*4, 4),
-            nn.MultiheadAttention(model_channels*4, 4),
-            nn.MultiheadAttention(model_channels*8, 4)
-        ])
-
-        # Middle blocks with attention
-        self.middle_block1 = Block(model_channels*8, model_channels*8, combined_dim)
+        # Middle (no spatial change)
+        self.middle_block1 = Block(
+            model_channels*4, model_channels*4, combined_dim)
+        # override transform to preserve spatial dims
         self.middle_block1.transform = nn.Identity()
-        self.middle_attention = nn.MultiheadAttention(model_channels*8, 8)
-        self.middle_block2 = Block(model_channels*8, model_channels*8, combined_dim)
+        self.middle_block2 = Block(
+            model_channels*4, model_channels*4, combined_dim)
         self.middle_block2.transform = nn.Identity()
 
-        # Upsampling with attention
+        # Upsampling: match channels after concatenation of h and skip
         self.ups = nn.ModuleList([
-            Block(model_channels*8 + model_channels*8, model_channels*8, combined_dim, up=True),
-            Block(model_channels*8 + model_channels*4, model_channels*4, combined_dim, up=True),
-            Block(model_channels*4 + model_channels*4, model_channels*4, combined_dim, up=True),
-            Block(model_channels*4 + model_channels*2, model_channels*2, combined_dim, up=True)
+            # block0: in 256+256=512 -> out 256
+            Block(model_channels*4 + model_channels*4,
+                  model_channels*4, combined_dim, up=True),
+            # block1: in 256+256=512 -> out 128
+            Block(model_channels*4 + model_channels*4,
+                  model_channels*2, combined_dim, up=True),
+            # block2: in 128+128=256 -> out 64
+            Block(model_channels*2 + model_channels*2,
+                  model_channels, combined_dim, up=True),
+            # block3: in 64+64=128  -> out 64
+            Block(model_channels + model_channels,
+                  model_channels, combined_dim, up=True)
         ])
 
-        # Attention layers for upsampling
-        self.up_attentions = nn.ModuleList([
-            nn.MultiheadAttention(model_channels*8, 4),
-            nn.MultiheadAttention(model_channels*4, 4),
-            nn.MultiheadAttention(model_channels*4, 4),
-            nn.MultiheadAttention(model_channels*2, 4)
-        ])
-
-        # Final layers with residual connection
+        # Final layers
         self.final_conv = nn.Sequential(
-            nn.Conv2d(model_channels*2, model_channels*2, 3, padding=1),
-            nn.BatchNorm2d(model_channels*2),
+            nn.Conv2d(model_channels, model_channels, 3, padding=1),
+            nn.BatchNorm2d(model_channels),
             nn.ReLU(),
-            nn.Conv2d(model_channels*2, model_channels*2, 3, padding=1),
-            nn.BatchNorm2d(model_channels*2),
-            nn.ReLU(),
-            nn.Conv2d(model_channels*2, out_channels, 3, padding=1)
+            nn.Conv2d(model_channels, out_channels, 3, padding=1)
         )
 
     def forward(self, x, t, condition):
@@ -150,15 +137,18 @@ class ConditionalUNet(nn.Module):
         Returns:
             Output tensor of shape [batch_size, out_channels, height, width]
         """
+        # Determine batch size
         batch_size = x.shape[0]
 
         # Process time embedding
         t_emb = self.time_mlp(t)
+        # Broadcast if needed
         if t_emb.shape[0] != batch_size:
             t_emb = t_emb.expand(batch_size, -1)
 
         # Process condition embedding
         c_emb = self.condition_mlp(condition)
+        # Broadcast condition to match batch size
         if c_emb.shape[0] != batch_size:
             c_emb = c_emb.expand(batch_size, -1)
 
@@ -167,38 +157,34 @@ class ConditionalUNet(nn.Module):
 
         # Initial conv
         h = self.conv1(x)
+        # Store skip connections from all down blocks
         skips = []
 
-        # Downsample with attention
-        for i, (down_block, attention) in enumerate(zip(self.downs, self.down_attentions)):
+        # Downsample: collect skip features at each level
+        for down_block in self.downs:
             h = down_block(h, temb_cond)
-            # Apply attention
-            h_flat = h.flatten(2).permute(2, 0, 1)  # [H*W, B, C]
-            h_attn, _ = attention(h_flat, h_flat, h_flat)
-            h = h_attn.permute(1, 2, 0).view_as(h)
             skips.append(h)
 
-        # Middle with attention
+        # Middle
         h = self.middle_block1(h, temb_cond)
-        h_flat = h.flatten(2).permute(2, 0, 1)
-        h_attn, _ = self.middle_attention(h_flat, h_flat, h_flat)
-        h = h_attn.permute(1, 2, 0).view_as(h)
         h = self.middle_block2(h, temb_cond)
 
-        # Upsample with attention and skip connections
-        for i, (up_block, attention) in enumerate(zip(self.ups, self.up_attentions)):
+        # Upsample with skip connections
+        # skips list: [down0, down1, down2, down3]
+        for i, up_block in enumerate(self.ups):
+            # select corresponding skip (from last down backwards)
             skip = skips[len(skips) - 1 - i]
+            # ensure spatial dims match before concatenation
             if h.shape[2:] != skip.shape[2:]:
                 h = F.interpolate(h, size=skip.shape[2:], mode='nearest')
+            # concatenate features
             h = torch.cat([h, skip], dim=1)
+            # apply up block (conv+time+conv+upsample)
             h = up_block(h, temb_cond)
-            # Apply attention
-            h_flat = h.flatten(2).permute(2, 0, 1)
-            h_attn, _ = attention(h_flat, h_flat, h_flat)
-            h = h_attn.permute(1, 2, 0).view_as(h)
 
-        # Final convolution with residual connection
+        # Final convolution
         output = self.final_conv(h)
+
         return output
 
 
@@ -236,10 +222,6 @@ class GaussianDiffusion:
             torch.sqrt(self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
         self.posterior_mean_coef2 = (
             1. - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1. - self.alphas_cumprod)
-
-        # DDIM sampling parameters
-        self.ddim_eta = 0.0  # DDIM noise parameter
-        self.ddim_timesteps = torch.linspace(0, len(betas)-1, 50).long()  # Reduced timesteps for DDIM
 
     def q_sample(self, x_0, t, noise=None):
         """
@@ -306,53 +288,18 @@ class GaussianDiffusion:
             return model_mean + torch.sqrt(posterior_variance_t) * noise
 
     @torch.no_grad()
-    def ddim_sample(self, model, x, t, t_index, condition):
+    def p_sample_loop(self, model, shape, condition, n_steps=1000):
         """
-        Sample from p(x_{t-1} | x_t) using DDIM sampling
-        """
-        # Get model prediction
-        pred_noise = model(x, t, condition)
-
-        # Get alpha and sigma
-        alpha = self.alphas_cumprod[t]
-        alpha_prev = self.alphas_cumprod_prev[t]
-        sigma = self.ddim_eta * torch.sqrt((1 - alpha_prev) / (1 - alpha)) * torch.sqrt(1 - alpha / alpha_prev)
-
-        # Calculate x_0
-        x_0 = (x - torch.sqrt(1 - alpha) * pred_noise) / torch.sqrt(alpha)
-
-        # Calculate mean
-        mean = torch.sqrt(alpha_prev) * x_0 + torch.sqrt(1 - alpha_prev - sigma**2) * pred_noise
-
-        # Add noise if not the last step
-        if t_index > 0:
-            noise = torch.randn_like(x)
-            return mean + sigma * noise
-        return mean
-
-    @torch.no_grad()
-    def p_sample_loop(self, model, shape, condition, n_steps=1000, use_ddim=True):
-        """
-        Generate samples from the model using DDIM or DDPM sampling
+        Generate samples from the model using DDPM sampling
         """
         device = next(model.parameters()).device
         b = shape[0]
-        
         # Start from pure noise
         img = torch.randn(shape, device=device)
         imgs = []
 
-        # Use DDIM timesteps if specified
-        timesteps = self.ddim_timesteps if use_ddim else torch.arange(n_steps-1, -1, -1)
-        
-        for i in timesteps:
-            img = self.ddim_sample(
-                model,
-                img,
-                torch.full((b,), i, device=device, dtype=torch.long),
-                i,
-                condition
-            ) if use_ddim else self.p_sample(
+        for i in reversed(range(0, n_steps)):
+            img = self.p_sample(
                 model,
                 img,
                 torch.full((b,), i, device=device, dtype=torch.long),
@@ -364,9 +311,9 @@ class GaussianDiffusion:
         return imgs
 
     @torch.no_grad()
-    def sample(self, model, condition, n_samples=1, n_steps=1000, use_ddim=True):
+    def sample(self, model, condition, n_samples=1, n_steps=1000):
         """
-        Generate n_samples from the model using DDIM or DDPM sampling
+        Generate n_samples from the model
         """
         # Prepare condition: ensure it's at least 2D
         if condition.dim() == 1:
@@ -378,8 +325,7 @@ class GaussianDiffusion:
             model,
             shape=(n_samples, 3, self.img_size, self.img_size),
             condition=condition,
-            n_steps=n_steps,
-            use_ddim=use_ddim
+            n_steps=n_steps
         )
 
 

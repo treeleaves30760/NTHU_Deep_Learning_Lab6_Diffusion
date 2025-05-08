@@ -10,7 +10,6 @@ import torchvision.transforms as transforms
 import argparse
 import numpy as np
 from pathlib import Path
-import math
 
 from dataset import get_dataloader, ICLEVRDataset
 from diffusion import create_diffusion_model
@@ -26,7 +25,7 @@ def train(args):
     os.makedirs("checkpoints", exist_ok=True)
     os.makedirs("../images", exist_ok=True)
 
-    # Create data loaders with num_workers
+    # Create data loaders
     train_dataloader = get_dataloader(
         json_path=args.train_json,
         image_dir=args.train_image_dir,
@@ -38,42 +37,13 @@ def train(args):
     model, diffusion = create_diffusion_model(
         img_size=args.img_size, device=device)
 
-    # Create optimizer with weight decay
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=args.lr * 0.1,  # Start with 10x smaller learning rate
-        weight_decay=0.0001,  # Further reduced weight decay
-        betas=(0.9, 0.999)
-    )
-
-    # Create learning rate scheduler with warmup
-    num_warmup_steps = len(train_dataloader) * 2  # 2 epochs of warmup
-    num_training_steps = len(train_dataloader) * args.epochs
-
-    def lr_lambda(current_step):
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        return 0.5 * (1.0 + math.cos(math.pi * float(current_step - num_warmup_steps) / float(num_training_steps - num_warmup_steps)))
-
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    # Initialize mixed precision training with dynamic loss scaling
-    scaler = torch.amp.GradScaler(
-        init_scale=2**10,
-        growth_factor=1.1,
-        backoff_factor=0.5,
-        growth_interval=100
-    )
+    # Create optimizer
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     # Training loop
-    best_loss = float('inf')
-    global_step = 0
-    accumulation_steps = 4  # Accumulate gradients for 4 steps
-
     for epoch in range(args.epochs):
         model.train()
         epoch_loss = 0.0
-        optimizer.zero_grad()  # Zero gradients at the start of epoch
         progress_bar = tqdm(enumerate(train_dataloader),
                             total=len(train_dataloader))
 
@@ -86,82 +56,32 @@ def train(args):
             t = torch.randint(0, args.diffusion_steps,
                               (batch_size,), device=device).long()
 
-            # Calculate loss with mixed precision
-            with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
-                loss = diffusion.p_losses(model, images, t, labels)
-                loss = loss / accumulation_steps  # Normalize loss for accumulation
+            # Calculate loss
+            loss = diffusion.p_losses(model, images, t, labels)
 
-            # Check for NaN loss before backprop
-            if torch.isnan(loss):
-                print(f"NaN loss detected at epoch {epoch+1}, step {step}")
-                optimizer.zero_grad()
-                continue
+            # Backpropagation
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-            # Backpropagation with gradient scaling
-            scaler.scale(loss).backward()
-
-            # Update weights if we've accumulated enough steps
-            if (step + 1) % accumulation_steps == 0:
-                # Check for NaN gradients before unscaling
-                has_nan_grad = False
-                for param in model.parameters():
-                    if param.grad is not None:
-                        if torch.isnan(param.grad).any():
-                            has_nan_grad = True
-                            break
-
-                if has_nan_grad:
-                    print(f"NaN gradients detected at epoch {epoch+1}, step {step}")
-                    optimizer.zero_grad()
-                    continue
-
-                # Unscale gradients and clip
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
-
-                # Update weights
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-
-                # Update learning rate
-                scheduler.step()
-                global_step += 1
-
-            # Update epoch loss (multiply by accumulation_steps to get true loss)
-            epoch_loss += loss.item() * accumulation_steps
+            epoch_loss += loss.item()
 
             # Update progress bar
             progress_bar.set_description(
-                f"Epoch {epoch+1}/{args.epochs}, Loss: {loss.item() * accumulation_steps:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+                f"Epoch {epoch+1}/{args.epochs}, Loss: {loss.item():.4f}")
 
         # Print epoch stats
-        avg_loss = epoch_loss/len(train_dataloader)
         print(
-            f"Epoch {epoch+1}/{args.epochs}, Avg Loss: {avg_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+            f"Epoch {epoch+1}/{args.epochs}, Avg Loss: {epoch_loss/len(train_dataloader):.4f}")
 
-        # Save checkpoint if loss improved
-        if avg_loss < best_loss and not torch.isnan(torch.tensor(avg_loss)):
-            best_loss = avg_loss
-            checkpoint_path = f"checkpoints/model_best.pth"
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'loss': avg_loss,
-            }, checkpoint_path)
-            print(f"Best model saved to {checkpoint_path}")
-
-        # Save regular checkpoint
+        # Save checkpoint
         if (epoch + 1) % args.save_every == 0:
             checkpoint_path = f"checkpoints/model_epoch_{epoch+1}.pth"
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'loss': avg_loss,
+                'loss': epoch_loss,
             }, checkpoint_path)
             print(f"Checkpoint saved to {checkpoint_path}")
 
