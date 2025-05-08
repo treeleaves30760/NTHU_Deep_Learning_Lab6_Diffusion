@@ -49,18 +49,18 @@ class ResidualBlock(nn.Module):
         super().__init__()
         self.time_mlp = nn.Linear(time_emb_dim, out_ch)
         self.use_attention = use_attention
-        
+
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
         self.norm1 = nn.GroupNorm(8, out_ch)
         self.act1 = nn.SiLU()
-        
+
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
         self.norm2 = nn.GroupNorm(8, out_ch)
         self.act2 = nn.SiLU()
-        
+
         if use_attention:
             self.attention = AttentionBlock(out_ch)
-            
+
         if in_ch != out_ch:
             self.shortcut = nn.Conv2d(in_ch, out_ch, 1)
         else:
@@ -68,18 +68,18 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x, t):
         h = self.act1(self.norm1(self.conv1(x)))
-        
+
         # Add time embedding
         time_emb = self.act1(self.time_mlp(t))
         time_emb = time_emb[(..., ) + (None, ) * 2]
         h = h + time_emb
-        
+
         h = self.act2(self.norm2(self.conv2(h)))
-        
+
         # Apply attention if specified
         if self.use_attention:
             h = self.attention(h)
-            
+
         # Residual connection
         return h + self.shortcut(x)
 
@@ -87,7 +87,8 @@ class ResidualBlock(nn.Module):
 class DownBlock(nn.Module):
     def __init__(self, in_ch, out_ch, time_emb_dim, use_attention=False):
         super().__init__()
-        self.residual_block = ResidualBlock(in_ch, out_ch, time_emb_dim, use_attention)
+        self.residual_block = ResidualBlock(
+            in_ch, out_ch, time_emb_dim, use_attention)
         self.downsample = nn.Conv2d(out_ch, out_ch, 4, 2, 1)
 
     def forward(self, x, t):
@@ -98,7 +99,8 @@ class DownBlock(nn.Module):
 class UpBlock(nn.Module):
     def __init__(self, in_ch, out_ch, time_emb_dim, use_attention=False):
         super().__init__()
-        self.residual_block = ResidualBlock(in_ch, out_ch, time_emb_dim, use_attention)
+        self.residual_block = ResidualBlock(
+            in_ch, out_ch, time_emb_dim, use_attention)
         self.upsample = nn.ConvTranspose2d(out_ch, out_ch, 4, 2, 1)
 
     def forward(self, x, t):
@@ -126,12 +128,12 @@ class ConditionalUNet(nn.Module):
             nn.SiLU()
         )
 
-        # Condition embedding
+        # Condition embedding - INCREASED STRENGTH
         self.condition_dim = condition_dim
         self.condition_mlp = nn.Sequential(
-            nn.Linear(num_classes, condition_dim),
+            nn.Linear(num_classes, condition_dim * 2),  # Increased size
             nn.SiLU(),
-            nn.Linear(condition_dim, condition_dim),
+            nn.Linear(condition_dim * 2, condition_dim),
             nn.SiLU(),
             nn.Linear(condition_dim, condition_dim)
         )
@@ -140,27 +142,38 @@ class ConditionalUNet(nn.Module):
         combined_dim = time_dim + condition_dim
 
         # Define channel dimensions for each level
-        channels = [model_channels, model_channels*2, model_channels*4, model_channels*8]
-        
+        channels = [model_channels, model_channels *
+                    2, model_channels*4, model_channels*8]
+
         # Initial projection
         self.init_conv = nn.Conv2d(in_channels, channels[0], 3, padding=1)
-        
+
         # Downsampling blocks
         self.down1 = DownBlock(channels[0], channels[0], combined_dim)
-        self.down2 = DownBlock(channels[0], channels[1], combined_dim, use_attention=True)
+        self.down2 = DownBlock(
+            channels[0], channels[1], combined_dim, use_attention=True)
         self.down3 = DownBlock(channels[1], channels[2], combined_dim)
-        self.down4 = DownBlock(channels[2], channels[3], combined_dim, use_attention=True)
-        
-        # Middle blocks
-        self.mid1 = ResidualBlock(channels[3], channels[3], combined_dim, use_attention=True)
-        self.mid2 = ResidualBlock(channels[3], channels[3], combined_dim, use_attention=True)
-        
+        self.down4 = DownBlock(
+            channels[2], channels[3], combined_dim, use_attention=True)
+
+        # Middle blocks - ADDED ONE MORE BLOCK
+        self.mid1 = ResidualBlock(
+            channels[3], channels[3], combined_dim, use_attention=True)
+        self.mid2 = ResidualBlock(
+            channels[3], channels[3], combined_dim, use_attention=True)
+        self.mid3 = ResidualBlock(
+            channels[3], channels[3], combined_dim, use_attention=True)  # Added block
+
         # Upsampling blocks with proper skip connection channels
-        self.up1 = UpBlock(channels[3] + channels[3], channels[2], combined_dim, use_attention=True)
-        self.up2 = UpBlock(channels[2] + channels[2], channels[1], combined_dim)
-        self.up3 = UpBlock(channels[1] + channels[1], channels[0], combined_dim, use_attention=True)
-        self.up4 = UpBlock(channels[0] + channels[0], channels[0], combined_dim)
-        
+        self.up1 = UpBlock(channels[3] + channels[3],
+                           channels[2], combined_dim, use_attention=True)
+        self.up2 = UpBlock(channels[2] + channels[2],
+                           channels[1], combined_dim)
+        self.up3 = UpBlock(channels[1] + channels[1],
+                           channels[0], combined_dim, use_attention=True)
+        self.up4 = UpBlock(channels[0] + channels[0],
+                           channels[0], combined_dim)
+
         # Final output layers
         self.final_conv = nn.Sequential(
             nn.GroupNorm(8, channels[0]),
@@ -174,39 +187,40 @@ class ConditionalUNet(nn.Module):
         """
         # Get batch size
         batch_size = x.shape[0]
-        
+
         # Process time embedding
         t_emb = self.time_mlp(t)
         if t_emb.shape[0] != batch_size:
             t_emb = t_emb.expand(batch_size, -1)
-            
+
         # Process condition embedding
         c_emb = self.condition_mlp(condition)
         if c_emb.shape[0] != batch_size:
             c_emb = c_emb.expand(batch_size, -1)
-            
+
         # Combined embedding
         emb = torch.cat([t_emb, c_emb], dim=1)
-        
+
         # Initial convolution
         x0 = self.init_conv(x)
-        
+
         # Downsampling path with explicit skip connections
         x1 = self.down1(x0, emb)
         x2 = self.down2(x1, emb)
         x3 = self.down3(x2, emb)
         x4 = self.down4(x3, emb)
-        
-        # Middle blocks
+
+        # Middle blocks - UPDATED WITH NEW BLOCK
         x = self.mid1(x4, emb)
         x = self.mid2(x, emb)
-        
+        x = self.mid3(x, emb)  # New block
+
         # Upsampling path with explicit skip connections
         x = self.up1(torch.cat([x, x4], dim=1), emb)
         x = self.up2(torch.cat([x, x3], dim=1), emb)
         x = self.up3(torch.cat([x, x2], dim=1), emb)
         x = self.up4(torch.cat([x, x1], dim=1), emb)
-        
+
         # Final convolution
         return self.final_conv(x)
 
@@ -281,33 +295,44 @@ class GaussianDiffusion:
         # Hybrid loss: combination of MSE and L1 loss
         mse_loss = F.mse_loss(predicted_noise, noise)
         l1_loss = F.l1_loss(predicted_noise, noise)
-        
+
         # Dynamically adjust loss weights based on timestep
         # For earlier timesteps (smaller t), prioritize MSE loss
         # For later timesteps (larger t), gradually increase L1 weight
         t_weight = t.float() / self.betas.shape[0]
         t_weight = t_weight.view(-1, 1, 1, 1)
         hybrid_weight = 0.9 - 0.4 * t_weight.mean()  # Ranges from 0.9 to 0.5
-        
+
         loss = hybrid_weight * mse_loss + (1 - hybrid_weight) * l1_loss
         return loss
 
     @torch.no_grad()
-    def p_sample(self, model, x, t, t_index, condition):
+    def p_sample(self, model, x, t, t_index, condition, guidance_scale=3.0):
         """
-        Sample from p(x_{t-1} | x_t) - reverse diffusion process
+        Sample from p(x_{t-1} | x_t) - reverse diffusion process with classifier-free guidance
         """
+        batch_size = x.shape[0]
         betas_t = self.betas[t].reshape(-1, 1, 1, 1)
         sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].reshape(
             -1, 1, 1, 1)
         sqrt_recip_alphas_t = torch.sqrt(
             1. / self.alphas[t]).reshape(-1, 1, 1, 1)
 
-        # Equation 11 in the paper
-        # Use predicted noise to compute x_0
+        # Classifier-free guidance implementation
+        # Predict noise with conditional and unconditional inputs
+        uncond = torch.zeros_like(condition).to(self.device)
+
+        # Get both predictions
+        noise_cond = model(x, t, condition)
+        noise_uncond = model(x, t, uncond)
+
+        # Apply guidance (combination of conditional and unconditional)
+        guided_noise = noise_uncond + \
+            guidance_scale * (noise_cond - noise_uncond)
+
+        # Equation 11 in the paper with guided noise
         model_mean = sqrt_recip_alphas_t * (
-            x - betas_t * model(x, t, condition) /
-            sqrt_one_minus_alphas_cumprod_t
+            x - betas_t * guided_noise / sqrt_one_minus_alphas_cumprod_t
         )
 
         if t_index == 0:
@@ -320,9 +345,9 @@ class GaussianDiffusion:
             return model_mean + torch.sqrt(posterior_variance_t) * noise
 
     @torch.no_grad()
-    def p_sample_loop(self, model, shape, condition, n_steps=1000):
+    def p_sample_loop(self, model, shape, condition, n_steps=1000, guidance_scale=3.0):
         """
-        Generate samples from the model using DDPM sampling
+        Generate samples from the model using DDPM sampling with classifier-free guidance
         """
         device = next(model.parameters()).device
         b = shape[0]
@@ -336,16 +361,17 @@ class GaussianDiffusion:
                 img,
                 torch.full((b,), i, device=device, dtype=torch.long),
                 i,
-                condition
+                condition,
+                guidance_scale=guidance_scale
             )
             imgs.append(img.cpu())
 
         return imgs
 
     @torch.no_grad()
-    def sample(self, model, condition, n_samples=1, n_steps=1000):
+    def sample(self, model, condition, n_samples=1, n_steps=1000, guidance_scale=3.0):
         """
-        Generate n_samples from the model
+        Generate n_samples from the model with classifier-free guidance
         """
         # Prepare condition: ensure it's at least 2D
         if condition.dim() == 1:
@@ -357,7 +383,8 @@ class GaussianDiffusion:
             model,
             shape=(n_samples, 3, self.img_size, self.img_size),
             condition=condition,
-            n_steps=n_steps
+            n_steps=n_steps,
+            guidance_scale=guidance_scale
         )
 
 
@@ -373,22 +400,39 @@ def create_cosine_schedule(n_steps=1000, s=0.008):
     return torch.clip(betas, 0, 0.999)
 
 
-def create_diffusion_model(img_size=64, device="cuda"):
+def create_linear_schedule(n_steps=1000, beta_start=1e-4, beta_end=2e-2):
+    """
+    Create a linear beta schedule for diffusion
+    """
+    return torch.linspace(beta_start, beta_end, n_steps)
+
+
+def create_diffusion_model(img_size=64, device="cuda", schedule_type="cosine"):
     """
     Create the UNet model and Gaussian diffusion process
+
+    Args:
+        img_size: Size of the images
+        device: Device to use
+        schedule_type: Type of noise schedule to use, either "cosine" or "linear"
     """
-    # Create beta schedule - using cosine schedule
+    # Create beta schedule based on the specified type
     n_steps = 1000
-    betas = create_cosine_schedule(n_steps=n_steps).to(device)
+    if schedule_type == "cosine":
+        betas = create_cosine_schedule(n_steps=n_steps).to(device)
+    elif schedule_type == "linear":
+        betas = create_linear_schedule(n_steps=n_steps).to(device)
+    else:
+        raise ValueError(f"Unknown schedule type: {schedule_type}")
 
     # Create model with improved architecture
-    model = ConditionalUNet(in_channels=3, 
-                          model_channels=128,  # Increased from 64 to 128
-                          out_channels=3,
-                          num_classes=24,
-                          time_dim=512,       # Increased from 256 to 512
-                          condition_dim=256   # Increased from 128 to 256
-                         ).to(device)
+    model = ConditionalUNet(in_channels=3,
+                            model_channels=128,  # Increased from 64 to 128
+                            out_channels=3,
+                            num_classes=24,
+                            time_dim=512,       # Increased from 256 to 512
+                            condition_dim=256   # Increased from 128 to 256
+                            ).to(device)
 
     # Create diffusion process
     diffusion = GaussianDiffusion(betas, img_size=img_size, device=device)

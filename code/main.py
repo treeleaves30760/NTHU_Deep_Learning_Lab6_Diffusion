@@ -10,7 +10,7 @@ from evaluator import evaluation_model
 from train import load_model, denormalize, visualize_denoising_process
 
 
-def run_evaluation(model, diffusion, dataloader, evaluator, device, output_dir, prefix="test"):
+def run_evaluation(model, diffusion, dataloader, evaluator, device, output_dir, prefix="test", guidance_scale=3.0):
     """Run evaluation on a dataset and save images"""
     total_acc = 0
     batch_samples = []
@@ -22,7 +22,8 @@ def run_evaluation(model, diffusion, dataloader, evaluator, device, output_dir, 
         batch_size = labels.shape[0]
 
         # Generate samples
-        samples = diffusion.sample(model, labels, n_samples=1, n_steps=1000)
+        samples = diffusion.sample(
+            model, labels, n_samples=1, n_steps=1000, guidance_scale=guidance_scale)
         final_samples = samples[-1]  # Get the last step
 
         # Evaluate accuracy
@@ -62,6 +63,25 @@ def run_evaluation(model, diffusion, dataloader, evaluator, device, output_dir, 
     return avg_acc
 
 
+def load_model(checkpoint_path, device, schedule_type=None):
+    """Load model from checkpoint, with optional schedule override"""
+    # If a specific schedule type is provided, use it
+    if schedule_type:
+        print(f"Using specified {schedule_type} noise schedule")
+        model, diffusion = create_diffusion_model(
+            device=device, schedule_type=schedule_type)
+
+        # Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        # Use the default method that reads from checkpoint
+        from train import load_model as train_load_model
+        model, diffusion = train_load_model(checkpoint_path, device)
+
+    return model, diffusion
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="DDPM Model for ICLEVaR Dataset")
@@ -77,6 +97,10 @@ def main():
                         help='Batch size for testing')
     parser.add_argument('--visualize', action='store_true',
                         help='Visualize the denoising process')
+    parser.add_argument('--guidance_scale', type=float, default=3.0,
+                        help='Guidance scale for classifier-free guidance')
+    parser.add_argument('--schedule_type', type=str, choices=['cosine', 'linear'],
+                        help='Type of noise schedule to use (overrides checkpoint setting)')
 
     args = parser.parse_args()
 
@@ -88,7 +112,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Load model
-    model, diffusion = load_model(args.checkpoint, device)
+    model, diffusion = load_model(args.checkpoint, device, args.schedule_type)
     model.eval()
 
     # Load evaluator
@@ -103,12 +127,12 @@ def main():
     # Run evaluation on test set
     print("Evaluating on test.json...")
     test_acc = run_evaluation(model, diffusion, test_dataloader,
-                              evaluator, device, args.output_dir, prefix="test")
+                              evaluator, device, args.output_dir, prefix="test", guidance_scale=args.guidance_scale)
 
     # Run evaluation on new test set
     print("Evaluating on new_test.json...")
     new_test_acc = run_evaluation(
-        model, diffusion, new_test_dataloader, evaluator, device, args.output_dir, prefix="new_test")
+        model, diffusion, new_test_dataloader, evaluator, device, args.output_dir, prefix="new_test", guidance_scale=args.guidance_scale)
 
     # Print final results
     print(f"\nFinal Results:")
@@ -125,6 +149,7 @@ def main():
                 self.test_json = args.test_json
                 self.img_size = 64
                 self.diffusion_steps = 1000
+                self.guidance_scale = args.guidance_scale
 
         visualize_denoising_process(Args())
 

@@ -33,12 +33,15 @@ def train(args):
         is_train=True
     )
 
-    # Create model and diffusion process
+    # Create model and diffusion process with specified schedule
     model, diffusion = create_diffusion_model(
-        img_size=args.img_size, device=device)
+        img_size=args.img_size, device=device, schedule_type=args.schedule_type)
 
-    # Create optimizer
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    print(f"Using {args.schedule_type} noise schedule")
+
+    # Create optimizer with weight decay
+    # Added weight decay and reduced lr
+    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
 
     # Training loop
     for epoch in range(args.epochs):
@@ -82,12 +85,14 @@ def train(args):
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': epoch_loss,
+                'schedule_type': args.schedule_type  # Save schedule type in checkpoint
             }, checkpoint_path)
             print(f"Checkpoint saved to {checkpoint_path}")
 
             # Generate samples
             if args.generate_samples:
-                generate_samples(model, diffusion, device, epoch=epoch+1)
+                generate_samples(model, diffusion, device,
+                                 epoch=epoch+1, guidance_scale=args.guidance_scale)
 
 
 def denormalize(images):
@@ -95,7 +100,7 @@ def denormalize(images):
     return (images * 0.5 + 0.5).clamp(0, 1)
 
 
-def generate_samples(model, diffusion, device, epoch=None, n_samples=8):
+def generate_samples(model, diffusion, device, epoch=None, n_samples=8, guidance_scale=3.0):
     """Generate and save a grid of samples"""
     model.eval()
 
@@ -109,9 +114,9 @@ def generate_samples(model, diffusion, device, epoch=None, n_samples=8):
     condition = torch.zeros(1, 24).to(device)
     condition[0, red_sphere_idx] = 1
 
-    # Generate samples
+    # Generate samples with increased steps and classifier-free guidance
     samples = diffusion.sample(
-        model, condition, n_samples=n_samples, n_steps=100)
+        model, condition, n_samples=n_samples, n_steps=250, guidance_scale=guidance_scale)  # Increased steps and added guidance
 
     # Get final image and denormalize
     final_sample = samples[-1]
@@ -130,9 +135,18 @@ def generate_samples(model, diffusion, device, epoch=None, n_samples=8):
 
 def load_model(checkpoint_path, device):
     """Load model from checkpoint"""
-    model, diffusion = create_diffusion_model(device=device)
-
+    # Load checkpoint first to get schedule type if available
     checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    # Get schedule type from checkpoint or default to cosine
+    schedule_type = checkpoint.get('schedule_type', 'cosine')
+    print(f"Using {schedule_type} noise schedule from checkpoint")
+
+    # Create model with correct schedule
+    model, diffusion = create_diffusion_model(
+        device=device, schedule_type=schedule_type)
+
+    # Load model weights
     model.load_state_dict(checkpoint['model_state_dict'])
 
     return model, diffusion
@@ -171,9 +185,9 @@ def test(args):
         labels = labels.to(device)
         batch_size = labels.shape[0]
 
-        # Generate samples
+        # Generate samples with classifier-free guidance
         samples = diffusion.sample(
-            model, labels, n_samples=1, n_steps=args.diffusion_steps)
+            model, labels, n_samples=1, n_steps=args.diffusion_steps, guidance_scale=3.0)
         final_samples = samples[-1]  # Get the last step samples
 
         # Evaluate with classifier
@@ -229,12 +243,13 @@ def visualize_denoising_process(args):
 
     conditions = conditions.to(device)
 
-    # Generate samples with intermediate steps
+    # Generate samples with intermediate steps using classifier-free guidance
     sample_steps = diffusion.p_sample_loop(
         model,
         shape=(len(condition_labels), 3, args.img_size, args.img_size),
         condition=conditions,
-        n_steps=args.diffusion_steps
+        n_steps=args.diffusion_steps,
+        guidance_scale=3.0  # Added guidance scale
     )
 
     # Select steps to visualize (8 steps from noise to clear)
@@ -292,6 +307,13 @@ def main():
                               default=10, help='Save checkpoint every N epochs')
     train_parser.add_argument(
         '--generate_samples', action='store_true', help='Generate samples during training')
+    train_parser.add_argument(
+        '--schedule_type', type=str, default='cosine', choices=['cosine', 'linear'],
+        help='Noise schedule type')
+    train_parser.add_argument(
+        '--guidance_scale', type=float, default=3.0, help='Guidance scale for generation')
+    train_parser.add_argument(
+        '--weight_decay', type=float, default=1e-5, help='Weight decay for optimizer')
 
     # Test arguments
     test_parser = subparsers.add_parser('test', help='Test the model')
@@ -301,12 +323,20 @@ def main():
                              default='test.json', help='Path to test json')
     test_parser.add_argument('--batch_size', type=int,
                              default=32, help='Batch size')
+    test_parser.add_argument('--guidance_scale', type=float, default=3.0,
+                             help='Guidance scale for classifier-free guidance')
+    test_parser.add_argument('--schedule_type', type=str, choices=['cosine', 'linear'],
+                             help='Override noise schedule type')
 
     # Visualization arguments
     vis_parser = subparsers.add_parser(
         'visualize', help='Visualize denoising process')
     vis_parser.add_argument('--checkpoint', type=str,
                             required=True, help='Path to model checkpoint')
+    vis_parser.add_argument('--guidance_scale', type=float, default=3.0,
+                            help='Guidance scale for classifier-free guidance')
+    vis_parser.add_argument('--schedule_type', type=str, choices=['cosine', 'linear'],
+                            help='Override noise schedule type')
 
     args = parser.parse_args()
 
