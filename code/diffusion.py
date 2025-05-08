@@ -21,34 +21,89 @@ class SinusoidalPositionEmbeddings(nn.Module):
         return embeddings
 
 
-class Block(nn.Module):
-    def __init__(self, in_ch, out_ch, time_emb_dim, up=False):
+class AttentionBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.channels = channels
+        self.mha = nn.MultiheadAttention(channels, 4, batch_first=True)
+        self.ln = nn.LayerNorm([channels])
+        self.ff_self = nn.Sequential(
+            nn.LayerNorm([channels]),
+            nn.Linear(channels, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels),
+        )
+
+    def forward(self, x):
+        size = x.shape[-2:]
+        x = x.flatten(2).transpose(1, 2)
+        x_ln = self.ln(x)
+        attention_value, _ = self.mha(x_ln, x_ln, x_ln)
+        attention_value = attention_value + x
+        attention_value = self.ff_self(attention_value) + attention_value
+        return attention_value.transpose(1, 2).reshape(-1, self.channels, *size)
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, time_emb_dim, use_attention=False):
         super().__init__()
         self.time_mlp = nn.Linear(time_emb_dim, out_ch)
-        if up:
-            self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
-            self.transform = nn.ConvTranspose2d(out_ch, out_ch, 4, 2, 1)
-        else:
-            self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
-            self.transform = nn.Conv2d(out_ch, out_ch, 4, 2, 1)
+        self.use_attention = use_attention
+        
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.norm1 = nn.GroupNorm(8, out_ch)
+        self.act1 = nn.SiLU()
+        
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
-        self.bnorm1 = nn.BatchNorm2d(out_ch)
-        self.bnorm2 = nn.BatchNorm2d(out_ch)
-        self.relu = nn.ReLU()
+        self.norm2 = nn.GroupNorm(8, out_ch)
+        self.act2 = nn.SiLU()
+        
+        if use_attention:
+            self.attention = AttentionBlock(out_ch)
+            
+        if in_ch != out_ch:
+            self.shortcut = nn.Conv2d(in_ch, out_ch, 1)
+        else:
+            self.shortcut = nn.Identity()
 
     def forward(self, x, t):
-        # First Conv
-        h = self.bnorm1(self.relu(self.conv1(x)))
-        # Time embedding
-        time_emb = self.relu(self.time_mlp(t))
-        # Extend dimensions
+        h = self.act1(self.norm1(self.conv1(x)))
+        
+        # Add time embedding
+        time_emb = self.act1(self.time_mlp(t))
         time_emb = time_emb[(..., ) + (None, ) * 2]
-        # Add time channel
         h = h + time_emb
-        # Second Conv
-        h = self.bnorm2(self.relu(self.conv2(h)))
-        # Down or Upsample
-        return self.transform(h)
+        
+        h = self.act2(self.norm2(self.conv2(h)))
+        
+        # Apply attention if specified
+        if self.use_attention:
+            h = self.attention(h)
+            
+        # Residual connection
+        return h + self.shortcut(x)
+
+
+class DownBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, time_emb_dim, use_attention=False):
+        super().__init__()
+        self.residual_block = ResidualBlock(in_ch, out_ch, time_emb_dim, use_attention)
+        self.downsample = nn.Conv2d(out_ch, out_ch, 4, 2, 1)
+
+    def forward(self, x, t):
+        x = self.residual_block(x, t)
+        return self.downsample(x)
+
+
+class UpBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, time_emb_dim, use_attention=False):
+        super().__init__()
+        self.residual_block = ResidualBlock(in_ch, out_ch, time_emb_dim, use_attention)
+        self.upsample = nn.ConvTranspose2d(out_ch, out_ch, 4, 2, 1)
+
+    def forward(self, x, t):
+        x = self.residual_block(x, t)
+        return self.upsample(x)
 
 
 class ConditionalUNet(nn.Module):
@@ -57,8 +112,8 @@ class ConditionalUNet(nn.Module):
     and returns the noise added to the image.
     """
 
-    def __init__(self, in_channels=3, model_channels=64, out_channels=3, num_classes=24,
-                 time_dim=256, condition_dim=128):
+    def __init__(self, in_channels=3, model_channels=128, out_channels=3, num_classes=24,
+                 time_dim=512, condition_dim=256):
         super().__init__()
 
         # Time embedding
@@ -66,126 +121,94 @@ class ConditionalUNet(nn.Module):
         self.time_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(time_dim),
             nn.Linear(time_dim, time_dim),
-            nn.ReLU()
+            nn.SiLU(),
+            nn.Linear(time_dim, time_dim),
+            nn.SiLU()
         )
 
         # Condition embedding
         self.condition_dim = condition_dim
         self.condition_mlp = nn.Sequential(
             nn.Linear(num_classes, condition_dim),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(condition_dim, condition_dim),
-            nn.ReLU()
+            nn.SiLU(),
+            nn.Linear(condition_dim, condition_dim)
         )
 
         # Combined embedding dimension
         combined_dim = time_dim + condition_dim
 
+        # Define channel dimensions for each level
+        channels = [model_channels, model_channels*2, model_channels*4, model_channels*8]
+        
         # Initial projection
-        self.conv1 = nn.Conv2d(in_channels, model_channels, 3, padding=1)
-
-        # Downsampling
-        self.downs = nn.ModuleList([
-            Block(model_channels, model_channels, combined_dim),
-            Block(model_channels, model_channels*2, combined_dim),
-            Block(model_channels*2, model_channels*4, combined_dim),
-            Block(model_channels*4, model_channels*4, combined_dim)
-        ])
-
-        # Middle (no spatial change)
-        self.middle_block1 = Block(
-            model_channels*4, model_channels*4, combined_dim)
-        # override transform to preserve spatial dims
-        self.middle_block1.transform = nn.Identity()
-        self.middle_block2 = Block(
-            model_channels*4, model_channels*4, combined_dim)
-        self.middle_block2.transform = nn.Identity()
-
-        # Upsampling: match channels after concatenation of h and skip
-        self.ups = nn.ModuleList([
-            # block0: in 256+256=512 -> out 256
-            Block(model_channels*4 + model_channels*4,
-                  model_channels*4, combined_dim, up=True),
-            # block1: in 256+256=512 -> out 128
-            Block(model_channels*4 + model_channels*4,
-                  model_channels*2, combined_dim, up=True),
-            # block2: in 128+128=256 -> out 64
-            Block(model_channels*2 + model_channels*2,
-                  model_channels, combined_dim, up=True),
-            # block3: in 64+64=128  -> out 64
-            Block(model_channels + model_channels,
-                  model_channels, combined_dim, up=True)
-        ])
-
-        # Final layers
+        self.init_conv = nn.Conv2d(in_channels, channels[0], 3, padding=1)
+        
+        # Downsampling blocks
+        self.down1 = DownBlock(channels[0], channels[0], combined_dim)
+        self.down2 = DownBlock(channels[0], channels[1], combined_dim, use_attention=True)
+        self.down3 = DownBlock(channels[1], channels[2], combined_dim)
+        self.down4 = DownBlock(channels[2], channels[3], combined_dim, use_attention=True)
+        
+        # Middle blocks
+        self.mid1 = ResidualBlock(channels[3], channels[3], combined_dim, use_attention=True)
+        self.mid2 = ResidualBlock(channels[3], channels[3], combined_dim, use_attention=True)
+        
+        # Upsampling blocks with proper skip connection channels
+        self.up1 = UpBlock(channels[3] + channels[3], channels[2], combined_dim, use_attention=True)
+        self.up2 = UpBlock(channels[2] + channels[2], channels[1], combined_dim)
+        self.up3 = UpBlock(channels[1] + channels[1], channels[0], combined_dim, use_attention=True)
+        self.up4 = UpBlock(channels[0] + channels[0], channels[0], combined_dim)
+        
+        # Final output layers
         self.final_conv = nn.Sequential(
-            nn.Conv2d(model_channels, model_channels, 3, padding=1),
-            nn.BatchNorm2d(model_channels),
-            nn.ReLU(),
-            nn.Conv2d(model_channels, out_channels, 3, padding=1)
+            nn.GroupNorm(8, channels[0]),
+            nn.SiLU(),
+            nn.Conv2d(channels[0], out_channels, 3, padding=1)
         )
 
     def forward(self, x, t, condition):
         """
         Apply the model to an input batch.
-
-        Args:
-            x: Input tensor of shape [batch_size, in_channels, height, width]
-            t: Time embedding tensor of shape [batch_size]
-            condition: Conditional embedding tensor of shape [batch_size, num_classes]
-
-        Returns:
-            Output tensor of shape [batch_size, out_channels, height, width]
         """
-        # Determine batch size
+        # Get batch size
         batch_size = x.shape[0]
-
+        
         # Process time embedding
         t_emb = self.time_mlp(t)
-        # Broadcast if needed
         if t_emb.shape[0] != batch_size:
             t_emb = t_emb.expand(batch_size, -1)
-
+            
         # Process condition embedding
         c_emb = self.condition_mlp(condition)
-        # Broadcast condition to match batch size
         if c_emb.shape[0] != batch_size:
             c_emb = c_emb.expand(batch_size, -1)
-
-        # Combine time and condition embeddings
-        temb_cond = torch.cat([t_emb, c_emb], dim=1)
-
-        # Initial conv
-        h = self.conv1(x)
-        # Store skip connections from all down blocks
-        skips = []
-
-        # Downsample: collect skip features at each level
-        for down_block in self.downs:
-            h = down_block(h, temb_cond)
-            skips.append(h)
-
-        # Middle
-        h = self.middle_block1(h, temb_cond)
-        h = self.middle_block2(h, temb_cond)
-
-        # Upsample with skip connections
-        # skips list: [down0, down1, down2, down3]
-        for i, up_block in enumerate(self.ups):
-            # select corresponding skip (from last down backwards)
-            skip = skips[len(skips) - 1 - i]
-            # ensure spatial dims match before concatenation
-            if h.shape[2:] != skip.shape[2:]:
-                h = F.interpolate(h, size=skip.shape[2:], mode='nearest')
-            # concatenate features
-            h = torch.cat([h, skip], dim=1)
-            # apply up block (conv+time+conv+upsample)
-            h = up_block(h, temb_cond)
-
+            
+        # Combined embedding
+        emb = torch.cat([t_emb, c_emb], dim=1)
+        
+        # Initial convolution
+        x0 = self.init_conv(x)
+        
+        # Downsampling path with explicit skip connections
+        x1 = self.down1(x0, emb)
+        x2 = self.down2(x1, emb)
+        x3 = self.down3(x2, emb)
+        x4 = self.down4(x3, emb)
+        
+        # Middle blocks
+        x = self.mid1(x4, emb)
+        x = self.mid2(x, emb)
+        
+        # Upsampling path with explicit skip connections
+        x = self.up1(torch.cat([x, x4], dim=1), emb)
+        x = self.up2(torch.cat([x, x3], dim=1), emb)
+        x = self.up3(torch.cat([x, x2], dim=1), emb)
+        x = self.up4(torch.cat([x, x1], dim=1), emb)
+        
         # Final convolution
-        output = self.final_conv(h)
-
-        return output
+        return self.final_conv(x)
 
 
 class GaussianDiffusion:
@@ -255,9 +278,18 @@ class GaussianDiffusion:
                 align_corners=False
             )
 
-        # Simple MSE loss
-        loss = F.mse_loss(predicted_noise, noise)
-
+        # Hybrid loss: combination of MSE and L1 loss
+        mse_loss = F.mse_loss(predicted_noise, noise)
+        l1_loss = F.l1_loss(predicted_noise, noise)
+        
+        # Dynamically adjust loss weights based on timestep
+        # For earlier timesteps (smaller t), prioritize MSE loss
+        # For later timesteps (larger t), gradually increase L1 weight
+        t_weight = t.float() / self.betas.shape[0]
+        t_weight = t_weight.view(-1, 1, 1, 1)
+        hybrid_weight = 0.9 - 0.4 * t_weight.mean()  # Ranges from 0.9 to 0.5
+        
+        loss = hybrid_weight * mse_loss + (1 - hybrid_weight) * l1_loss
         return loss
 
     @torch.no_grad()
@@ -329,17 +361,34 @@ class GaussianDiffusion:
         )
 
 
+def create_cosine_schedule(n_steps=1000, s=0.008):
+    """
+    Create a cosine noise schedule as proposed in 'Improved Denoising Diffusion Probabilistic Models'
+    """
+    steps = torch.linspace(0, n_steps, n_steps + 1)
+    x = steps / n_steps
+    alphas_cumprod = torch.cos((x + s) / (1 + s) * torch.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0, 0.999)
+
+
 def create_diffusion_model(img_size=64, device="cuda"):
     """
     Create the UNet model and Gaussian diffusion process
     """
-    # Create beta schedule
+    # Create beta schedule - using cosine schedule
     n_steps = 1000
-    betas = torch.linspace(1e-4, 0.02, n_steps).to(device)
+    betas = create_cosine_schedule(n_steps=n_steps).to(device)
 
-    # Create model
-    model = ConditionalUNet(in_channels=3, out_channels=3,
-                            num_classes=24).to(device)
+    # Create model with improved architecture
+    model = ConditionalUNet(in_channels=3, 
+                          model_channels=128,  # Increased from 64 to 128
+                          out_channels=3,
+                          num_classes=24,
+                          time_dim=512,       # Increased from 256 to 512
+                          condition_dim=256   # Increased from 128 to 256
+                         ).to(device)
 
     # Create diffusion process
     diffusion = GaussianDiffusion(betas, img_size=img_size, device=device)
