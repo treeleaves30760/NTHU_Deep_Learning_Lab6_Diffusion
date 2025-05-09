@@ -190,6 +190,9 @@ def test(args):
             model, labels, n_samples=1, n_steps=args.diffusion_steps, guidance_scale=3.0)
         final_samples = samples[-1]  # Get the last step samples
 
+        # Move samples to the same device as the evaluator model (CUDA)
+        final_samples = final_samples.to(device)
+
         # Evaluate with classifier
         acc = evaluator.eval(final_samples, labels)
         total_acc += acc * batch_size
@@ -333,6 +336,8 @@ def main():
         'visualize', help='Visualize denoising process')
     vis_parser.add_argument('--checkpoint', type=str,
                             required=True, help='Path to model checkpoint')
+    vis_parser.add_argument('--test_json', type=str,
+                            default='test.json', help='Path to test json')
     vis_parser.add_argument('--guidance_scale', type=float, default=3.0,
                             help='Guidance scale for classifier-free guidance')
     vis_parser.add_argument('--schedule_type', type=str, choices=['cosine', 'linear'],

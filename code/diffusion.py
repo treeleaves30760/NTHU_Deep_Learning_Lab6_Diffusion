@@ -376,12 +376,14 @@ class GaussianDiffusion:
         # Prepare condition: ensure it's at least 2D
         if condition.dim() == 1:
             condition = condition.unsqueeze(0)
-        # Repeat or broadcast condition to match n_samples
-        if condition.shape[0] != n_samples:
+        # Repeat or broadcast condition to match n_samples only if needed
+        if condition.shape[0] == 1 and n_samples > 1:
             condition = condition.expand(n_samples, -1)
+        # Use the actual batch size from the condition
+        actual_n_samples = condition.shape[0]
         return self.p_sample_loop(
             model,
-            shape=(n_samples, 3, self.img_size, self.img_size),
+            shape=(actual_n_samples, 3, self.img_size, self.img_size),
             condition=condition,
             n_steps=n_steps,
             guidance_scale=guidance_scale

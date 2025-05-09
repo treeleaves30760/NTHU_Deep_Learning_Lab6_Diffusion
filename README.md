@@ -56,7 +56,7 @@ To test the model:
 
 ```bash
 cd code
-python train.py test --checkpoint checkpoints/model_epoch_100.pth --test_json ../test.json --guidance_scale 3.0 --schedule_type cosine
+python train.py test --checkpoint checkpoints/model_epoch_1500.pth --test_json ./test.json --guidance_scale 3.0 --schedule_type cosine
 ```
 
 Arguments:
