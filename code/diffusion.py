@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import torchvision.models as models
 
 
 class SinusoidalPositionEmbeddings(nn.Module):
@@ -114,7 +115,7 @@ class ConditionalUNet(nn.Module):
     and returns the noise added to the image.
     """
 
-    def __init__(self, in_channels=3, model_channels=128, out_channels=3, num_classes=24,
+    def __init__(self, in_channels=3, model_channels=256, out_channels=3, num_classes=24,
                  time_dim=512, condition_dim=256):
         super().__init__()
 
@@ -228,6 +229,59 @@ class ConditionalUNet(nn.Module):
         return self.final_conv(x)
 
 
+class VGGPerceptualLoss(nn.Module):
+    def __init__(self, resize=True):
+        super(VGGPerceptualLoss, self).__init__()
+        vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
+        blocks = []
+        # First block - focus on color/low level features
+        blocks.append(vgg.features[:4].eval())
+        blocks.append(vgg.features[4:9].eval())  # Second block
+
+        for bl in blocks:
+            for p in bl.parameters():
+                p.requires_grad = False
+
+        self.blocks = nn.ModuleList(blocks)
+        self.transform = nn.functional.interpolate
+        self.resize = resize
+        self.register_buffer("mean", torch.tensor(
+            [0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor(
+            [0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def forward(self, input, target):
+        if input.shape[1] != 3:
+            input = input.repeat(1, 3, 1, 1)
+            target = target.repeat(1, 3, 1, 1)
+
+        # Normalize to ImageNet stats
+        input = (input * 0.5 + 0.5)  # Denormalize from [-1,1] to [0,1]
+        input = (input - self.mean) / self.std
+        target = (target * 0.5 + 0.5)  # Denormalize from [-1,1] to [0,1]
+        target = (target - self.mean) / self.std
+
+        if self.resize:
+            input = self.transform(input, mode='bilinear', size=(
+                224, 224), align_corners=False)
+            target = self.transform(target, mode='bilinear', size=(
+                224, 224), align_corners=False)
+
+        loss = 0.0
+        x = input
+        y = target
+
+        for i, block in enumerate(self.blocks):
+            with torch.no_grad():
+                x = block(x)
+                y = block(y)
+            # Emphasize early layers for color perception
+            layer_weight = 1.0 if i == 0 else 0.5  # Higher weight for earlier layers
+            loss += layer_weight * F.l1_loss(x, y)
+
+        return loss
+
+
 class GaussianDiffusion:
     """
     Gaussian diffusion model for image generation.
@@ -263,6 +317,9 @@ class GaussianDiffusion:
         self.posterior_mean_coef2 = (
             1. - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1. - self.alphas_cumprod)
 
+        # Initialize perceptual loss
+        self.perceptual_loss = VGGPerceptualLoss().to(device)
+
     def q_sample(self, x_0, t, noise=None):
         """
         Sample from q(x_t | x_0) - forward diffusion process
@@ -279,13 +336,14 @@ class GaussianDiffusion:
 
     def p_losses(self, denoise_model, x_0, t, condition, noise=None):
         """
-        Calculate the loss for training
+        Calculate the loss for training with enhanced color fidelity
         """
         if noise is None:
             noise = torch.randn_like(x_0)
 
         x_noisy = self.q_sample(x_0, t, noise)
         predicted_noise = denoise_model(x_noisy, t, condition)
+
         # Ensure predicted and target noise have the same spatial dimensions
         if predicted_noise.shape[2:] != noise.shape[2:]:
             predicted_noise = F.interpolate(
@@ -295,28 +353,64 @@ class GaussianDiffusion:
                 align_corners=False
             )
 
-        # Advanced loss calculation with focus on color fidelity
+        # Predict x_0 directly from noise prediction to use in perceptual loss
+        # x_0_pred = self.predict_x0_from_noise(x_noisy, t, predicted_noise)
+        # This is a simplified calculation of predicting x_0 from noise
+        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod[t].reshape(
+            -1, 1, 1, 1)
+        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].reshape(
+            -1, 1, 1, 1)
+        x_0_pred = (x_noisy - sqrt_one_minus_alphas_cumprod_t *
+                    predicted_noise) / sqrt_alphas_cumprod_t
+        x_0_pred = torch.clamp(x_0_pred, -1, 1)  # Ensure valid image range
+
+        # Basic losses - refined with weights specific to CLEVR objects
+        # MSE loss is good for overall structure and noise prediction
         mse_loss = F.mse_loss(predicted_noise, noise)
+
+        # L1 loss is good for sharpness and detail
         l1_loss = F.l1_loss(predicted_noise, noise)
 
-        # Apply frequency-based weighting to prioritize low-frequency components (colors)
-        # Calculate weighted loss in frequency domain to emphasize color information
+        # Calculate perceptual loss for better colors and shapes
+        # Only apply on a portion of the batch to save computation
         batch_size = x_0.shape[0]
-        color_loss = 0
+        # Limit to 4 samples for efficiency
+        perceptual_batch_size = min(4, batch_size)
 
+        # Only use perceptual loss for early timesteps (t < 500) where image structure is forming
+        timestep_mask = (t < 500).float().reshape(-1, 1, 1, 1)
+
+        # Get perceptual loss if we have low timesteps
+        perc_loss = 0.0
+        if torch.any(timestep_mask > 0):
+            # Calculate perceptual loss between the predicted clean image and the true clean image
+            # Only for samples with low timesteps
+            valid_indices = torch.where(t < 500)[0][:perceptual_batch_size]
+            if len(valid_indices) > 0:
+                x_0_pred_sample = x_0_pred[valid_indices]
+                x_0_sample = x_0[valid_indices]
+                perc_loss = self.perceptual_loss(x_0_pred_sample, x_0_sample)
+
+        # Channel-specific loss weighting for CLEVR objects
+        # CLEVR has specific colors (red, blue, green, yellow, cyan, purple, gray, brown, rubber/metal)
+        # Adjust weights for RGB channels based on importance in CLEVR dataset
+        color_loss = 0.0
         for i in range(batch_size):
-            # Calculate error in RGB channels separately
             for c in range(3):  # RGB channels
                 pred_noise_c = predicted_noise[i, c]
                 target_noise_c = noise[i, c]
 
-                # Calculate error and weight it more for color channels
-                if c == 0:  # R channel - weight higher for red objects
-                    channel_weight = 1.5
-                elif c == 1:  # G channel - weight higher for green objects
-                    channel_weight = 1.5
-                elif c == 2:  # B channel - weight higher for blue and cyan objects
-                    channel_weight = 1.5
+                # CLEVR-specific channel weights:
+                # Increase R channel weight for red objects
+                # Increase G channel weight for green objects
+                # Increase B channel for blue objects
+                # For cyan/yellow objects which use multiple channels, increase relevant weights
+                if c == 0:  # R channel
+                    channel_weight = 2.0  # Higher for red color accuracy
+                elif c == 1:  # G channel
+                    channel_weight = 1.8  # Higher for green color accuracy
+                elif c == 2:  # B channel
+                    channel_weight = 1.5  # Higher for blue color accuracy
 
                 # Apply channel-specific weighting
                 channel_error = F.mse_loss(
@@ -325,17 +419,59 @@ class GaussianDiffusion:
 
         color_loss = color_loss / (batch_size * 3)
 
-        # Dynamically adjust loss weights based on timestep
-        # For earlier timesteps (smaller t), prioritize MSE loss
-        # For later timesteps (larger t), gradually increase L1 weight
-        t_weight = t.float() / self.betas.shape[0]
-        t_weight = t_weight.view(-1, 1, 1, 1)
-        hybrid_weight = 0.9 - 0.4 * t_weight.mean()  # Ranges from 0.9 to 0.5
+        # Dynamic timestep-aware loss weighting
+        # Early timesteps (t near 0): Focus on perceptual quality & color fidelity
+        # Middle timesteps: Balance between noise prediction & perceptual quality
+        # Late timesteps (t near T): Focus more on noise prediction
+        progress = t.float() / self.betas.shape[0]
 
-        # Combine losses with color_loss having significant weight
-        loss = 0.5 * hybrid_weight * mse_loss + 0.2 * \
-            (1 - hybrid_weight) * l1_loss + 0.3 * color_loss
+        # Reshape for broadcasting
+        progress = progress.view(-1, 1, 1, 1)
+
+        # Calculate weights based on timestep progress
+        # Range from 0.3 to 0.9
+        mse_weight = 0.6 - 0.3 * torch.cos(progress * math.pi)
+        # Range from 0.3 to 0.1
+        l1_weight = 0.2 + 0.1 * torch.cos(progress * math.pi)
+        color_weight = 0.3 - 0.1 * \
+            torch.cos(progress * math.pi)  # Range from 0.2 to 0.4
+        # Higher for early timesteps, fades to 0
+        perc_weight = 0.15 * (1.0 - progress)
+
+        # Take mean across batch for final weights
+        mse_weight_mean = mse_weight.mean().item()
+        l1_weight_mean = l1_weight.mean().item()
+        color_weight_mean = color_weight.mean().item()
+        perc_weight_mean = perc_weight.mean().item()
+
+        # Combined loss with all components
+        loss = (
+            mse_weight_mean * mse_loss +
+            l1_weight_mean * l1_loss +
+            color_weight_mean * color_loss
+        )
+
+        # Add perceptual loss if applicable
+        if perc_loss > 0:
+            loss += perc_weight_mean * perc_loss
+
         return loss
+
+    def predict_x0_from_noise(self, x_t, t, noise):
+        """
+        Predict x_0 from the predicted noise and the noisy image x_t.
+        """
+        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod[t].reshape(
+            -1, 1, 1, 1)
+        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].reshape(
+            -1, 1, 1, 1)
+
+        # Compute an estimate of the original image from the noise and noisy image
+        x_0 = (x_t - sqrt_one_minus_alphas_cumprod_t * noise) / \
+            sqrt_alphas_cumprod_t
+
+        # Clamp to ensure valid image range
+        return torch.clamp(x_0, -1, 1)
 
     @torch.no_grad()
     def p_sample(self, model, x, t, t_index, condition, guidance_scale=3.0):

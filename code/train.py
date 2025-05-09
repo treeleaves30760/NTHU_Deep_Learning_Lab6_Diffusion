@@ -41,11 +41,12 @@ def train(args):
 
     # Create optimizer with weight decay
     # Added weight decay and reduced lr
-    optimizer = optim.Adam(model.parameters(), lr=5e-5, weight_decay=2e-5)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr,
+                           weight_decay=args.weight_decay)
 
     # Add a learning rate scheduler to refine learning
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 'min', patience=5, factor=0.5
+        optimizer, 'min', patience=8, factor=0.5
     )
 
     # Training loop
@@ -54,6 +55,10 @@ def train(args):
         epoch_loss = 0.0
         progress_bar = tqdm(enumerate(train_dataloader),
                             total=len(train_dataloader))
+
+        # Track accumulated gradients and steps
+        accumulation_steps = args.accumulation_steps
+        optimizer.zero_grad()  # Zero gradients at the beginning of each epoch
 
         for step, (images, labels) in progress_bar:
             images = images.to(device)
@@ -67,20 +72,31 @@ def train(args):
             # Calculate loss
             loss = diffusion.p_losses(model, images, t, labels)
 
-            # Backpropagation
-            optimizer.zero_grad()
+            # Normalize loss to account for accumulation
+            loss = loss / accumulation_steps
+
+            # Backpropagation (accumulate gradients)
             loss.backward()
 
-            # Gradient clipping to stabilize training
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Update weights only after accumulation_steps
+            if (step + 1) % accumulation_steps == 0 or (step + 1 == len(train_dataloader)):
+                # Gradient clipping to stabilize training
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=2.0)
 
-            optimizer.step()
+                # Update parameters
+                optimizer.step()
+                optimizer.zero_grad()
 
-            epoch_loss += loss.item()
+                # For progress reporting
+                effective_step = step // accumulation_steps
+
+            # Track the unnormalized loss for reporting
+            epoch_loss += loss.item() * accumulation_steps
 
             # Update progress bar
             progress_bar.set_description(
-                f"Epoch {epoch+1}/{args.epochs}, Loss: {loss.item():.4f}")
+                f"Epoch {epoch+1}/{args.epochs}, Loss: {loss.item() * accumulation_steps:.4f}")
 
         # Calculate average epoch loss
         avg_epoch_loss = epoch_loss/len(train_dataloader)
@@ -130,43 +146,49 @@ def generate_samples(model, diffusion, device, epoch=None, n_samples=8, guidance
     # Create varied conditions to test color accuracy
     conditions = []
 
-    # First add red sphere (existing test)
-    red_sphere_idx = object_dict["red sphere"]
-    red_sphere_cond = torch.zeros(1, 24).to(device)
-    red_sphere_cond[0, red_sphere_idx] = 1
-    conditions.append(red_sphere_cond)
+    # Add single object conditions
+    single_objects = ["red sphere", "blue cube", "green cylinder", "yellow sphere",
+                      "cyan cylinder", "purple cube", "gray sphere"]
 
-    # Add blue cube
-    blue_cube_idx = object_dict["blue cube"]
-    blue_cube_cond = torch.zeros(1, 24).to(device)
-    blue_cube_cond[0, blue_cube_idx] = 1
-    conditions.append(blue_cube_cond)
+    # Add multi-object conditions to test complex scenes
+    multi_objects = [
+        ["red sphere", "blue cube"],
+        ["green cylinder", "yellow sphere", "cyan cube"],
+        ["red cube", "blue cylinder", "purple sphere"]
+    ]
 
-    # Add green cylinder
-    green_cyl_idx = object_dict["green cylinder"]
-    green_cyl_cond = torch.zeros(1, 24).to(device)
-    green_cyl_cond[0, green_cyl_idx] = 1
-    conditions.append(green_cyl_cond)
+    # Process single object conditions
+    for obj in single_objects:
+        if obj in object_dict:
+            obj_idx = object_dict[obj]
+            obj_cond = torch.zeros(1, 24).to(device)
+            obj_cond[0, obj_idx] = 1
+            conditions.append(obj_cond)
 
-    # Add yellow sphere
-    yellow_sphere_idx = object_dict["yellow sphere"]
-    yellow_sphere_cond = torch.zeros(1, 24).to(device)
-    yellow_sphere_cond[0, yellow_sphere_idx] = 1
-    conditions.append(yellow_sphere_cond)
+    # Process multi-object conditions
+    for obj_list in multi_objects:
+        multi_cond = torch.zeros(1, 24).to(device)
+        for obj in obj_list:
+            if obj in object_dict:
+                obj_idx = object_dict[obj]
+                multi_cond[0, obj_idx] = 1
+        conditions.append(multi_cond)
 
     # Concatenate all conditions
     condition = torch.cat(conditions, dim=0)
 
     # Generate samples with increased steps and classifier-free guidance
+    n_steps = 500  # Increased steps for better quality
     samples = diffusion.sample(
-        model, condition, n_samples=n_samples//4, n_steps=250, guidance_scale=guidance_scale*1.2)  # Increased guidance for better color
+        model, condition, n_samples=1, n_steps=n_steps, guidance_scale=guidance_scale*1.2)
 
     # Get final image and denormalize
     final_sample = samples[-1]
     final_sample = denormalize(final_sample)
 
     # Create and save grid
-    grid = torchvision.utils.make_grid(final_sample, nrow=4)
+    n_col = min(4, final_sample.shape[0])
+    grid = torchvision.utils.make_grid(final_sample, nrow=n_col)
     if epoch:
         save_path = f"../images/samples_epoch_{epoch}.png"
     else:
@@ -174,6 +196,24 @@ def generate_samples(model, diffusion, device, epoch=None, n_samples=8, guidance
 
     torchvision.utils.save_image(grid, save_path)
     print(f"Samples saved to {save_path}")
+
+    # Save individual samples with their condition labels
+    os.makedirs("../images/samples", exist_ok=True)
+
+    # Save individual samples with descriptive filenames
+    idx = 0
+    for i, obj_cond in enumerate(single_objects[:len(conditions)]):
+        if i < final_sample.shape[0]:
+            sample_path = f"../images/samples/sample_{epoch or 'test'}_{obj_cond.replace(' ', '_')}.png"
+            torchvision.utils.save_image(final_sample[i], sample_path)
+            idx += 1
+
+    # Save multi-object samples
+    for i, obj_list in enumerate(multi_objects):
+        if idx + i < final_sample.shape[0]:
+            obj_str = "_".join([obj.split(" ")[0] for obj in obj_list])
+            sample_path = f"../images/samples/sample_{epoch or 'test'}_multi_{obj_str}.png"
+            torchvision.utils.save_image(final_sample[idx + i], sample_path)
 
 
 def load_model(checkpoint_path, device, schedule_type=None):
@@ -206,7 +246,7 @@ def test(args):
     os.makedirs("../images", exist_ok=True)
 
     # Load model
-    model, diffusion = load_model(args.checkpoint, device)
+    model, diffusion = load_model(args.checkpoint, device, args.schedule_type)
     model.eval()
 
     # Load evaluator
@@ -226,9 +266,13 @@ def test(args):
     all_conditions = []
     progress_bar = tqdm(enumerate(test_dataloader), total=len(test_dataloader))
 
-    # Increased guidance scale for better color definition
-    guidance_scale = 4.5 if not hasattr(
-        args, 'guidance_scale') else args.guidance_scale
+    # Use the provided guidance scale with a slight boost to improve color fidelity
+    guidance_scale = args.guidance_scale
+    print(f"Using guidance scale of {guidance_scale}")
+
+    # Use more diffusion steps for better quality
+    diffusion_steps = max(args.diffusion_steps, 800)
+    print(f"Using {diffusion_steps} diffusion steps for sampling")
 
     for step, (images, labels) in progress_bar:
         labels = labels.to(device)
@@ -236,7 +280,7 @@ def test(args):
 
         # Generate samples with enhanced classifier-free guidance for better color
         samples = diffusion.sample(
-            model, labels, n_samples=1, n_steps=args.diffusion_steps, guidance_scale=guidance_scale)
+            model, labels, n_samples=1, n_steps=diffusion_steps, guidance_scale=guidance_scale)
         final_samples = samples[-1]  # Get the last step samples
 
         # Move samples to the same device as the evaluator model (CUDA)
@@ -248,6 +292,7 @@ def test(args):
 
         # Store for visualization
         all_samples.append(final_samples.cpu())
+        all_conditions.append(labels.cpu())
 
         # Update progress bar
         progress_bar.set_description(f"Testing, Batch Acc: {acc:.4f}")
@@ -258,6 +303,7 @@ def test(args):
 
     # Concatenate all samples
     all_samples = torch.cat(all_samples, dim=0)
+    all_conditions = torch.cat(all_conditions, dim=0)
 
     # Create grid of samples
     n_rows = (all_samples.shape[0] + 7) // 8  # Ceiling division
@@ -266,9 +312,26 @@ def test(args):
     torchvision.utils.save_image(grid, save_path)
     print(f"Test samples saved to {save_path}")
 
-    # Save individual samples
-    for i, sample in enumerate(all_samples):
-        sample_path = f"../images/test_sample_{i}.png"
+    # Save individual samples with condition information
+    os.makedirs("../images/test_results", exist_ok=True)
+
+    # Load object dictionary to get readable condition names
+    with open('objects.json', 'r') as f:
+        import json
+        object_dict = json.load(f)
+
+    # Invert the object dictionary for lookups
+    inv_object_dict = {v: k for k, v in object_dict.items()}
+
+    for i, (sample, condition) in enumerate(zip(all_samples, all_conditions)):
+        # Get condition names
+        obj_indices = torch.where(condition > 0.5)[0].tolist()
+        obj_names = [inv_object_dict.get(
+            idx, f"obj_{idx}") for idx in obj_indices]
+        condition_str = "_".join([name.split(" ")[0] for name in obj_names])
+
+        # Save sample with informative name
+        sample_path = f"../images/test_results/test_sample_{i}_{condition_str}.png"
         torchvision.utils.save_image(denormalize(sample), sample_path)
 
     return avg_acc
@@ -351,8 +414,10 @@ def main():
         '--train_image_dir', type=str, default='../iclevr', help='Path to training images')
     train_parser.add_argument('--batch_size', type=int,
                               default=32, help='Batch size')
+    train_parser.add_argument('--accumulation_steps', type=int,
+                              default=2, help='Gradient accumulation steps')
     train_parser.add_argument('--epochs', type=int,
-                              default=100, help='Number of epochs')
+                              default=1000, help='Number of epochs')
     train_parser.add_argument(
         '--lr', type=float, default=1e-4, help='Learning rate')
     train_parser.add_argument('--save_every', type=int,
@@ -363,9 +428,9 @@ def main():
         '--schedule_type', type=str, default='cosine', choices=['cosine', 'linear'],
         help='Noise schedule type')
     train_parser.add_argument(
-        '--guidance_scale', type=float, default=3.0, help='Guidance scale for generation')
+        '--guidance_scale', type=float, default=4.0, help='Guidance scale for generation')
     train_parser.add_argument(
-        '--weight_decay', type=float, default=1e-5, help='Weight decay for optimizer')
+        '--weight_decay', type=float, default=2e-5, help='Weight decay for optimizer')
 
     # Test arguments
     test_parser = subparsers.add_parser('test', help='Test the model')
@@ -375,7 +440,7 @@ def main():
                              default='test.json', help='Path to test json')
     test_parser.add_argument('--batch_size', type=int,
                              default=32, help='Batch size')
-    test_parser.add_argument('--guidance_scale', type=float, default=3.0,
+    test_parser.add_argument('--guidance_scale', type=float, default=4.5,
                              help='Guidance scale for classifier-free guidance')
     test_parser.add_argument('--schedule_type', type=str, choices=['cosine', 'linear'],
                              help='Override noise schedule type')
@@ -387,7 +452,7 @@ def main():
                             required=True, help='Path to model checkpoint')
     vis_parser.add_argument('--test_json', type=str,
                             default='test.json', help='Path to test json')
-    vis_parser.add_argument('--guidance_scale', type=float, default=3.0,
+    vis_parser.add_argument('--guidance_scale', type=float, default=4.5,
                             help='Guidance scale for classifier-free guidance')
     vis_parser.add_argument('--schedule_type', type=str, choices=['cosine', 'linear'],
                             help='Override noise schedule type')
