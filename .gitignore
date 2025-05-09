@@ -9,3 +9,7 @@
 # Images
 images/
 iclevr/
+
+*.pdf
+report.docx
+~*
