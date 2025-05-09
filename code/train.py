@@ -45,7 +45,7 @@ def train(args):
 
     # Add a learning rate scheduler to refine learning
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 'min', patience=5, factor=0.5, verbose=True
+        optimizer, 'min', patience=5, factor=0.5
     )
 
     # Training loop
@@ -86,11 +86,12 @@ def train(args):
         avg_epoch_loss = epoch_loss/len(train_dataloader)
 
         # Update scheduler based on epoch loss
+        current_lr = optimizer.param_groups[0]['lr']
         scheduler.step(avg_epoch_loss)
 
         # Print epoch stats
         print(
-            f"Epoch {epoch+1}/{args.epochs}, Avg Loss: {avg_epoch_loss:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
+            f"Epoch {epoch+1}/{args.epochs}, Avg Loss: {avg_epoch_loss:.4f}, LR: {current_lr:.6f}")
 
         # Save checkpoint
         if (epoch + 1) % args.save_every == 0:
