@@ -41,7 +41,12 @@ def train(args):
 
     # Create optimizer with weight decay
     # Added weight decay and reduced lr
-    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    optimizer = optim.Adam(model.parameters(), lr=5e-5, weight_decay=2e-5)
+
+    # Add a learning rate scheduler to refine learning
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 'min', patience=5, factor=0.5, verbose=True
+    )
 
     # Training loop
     for epoch in range(args.epochs):
@@ -65,6 +70,10 @@ def train(args):
             # Backpropagation
             optimizer.zero_grad()
             loss.backward()
+
+            # Gradient clipping to stabilize training
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
 
             epoch_loss += loss.item()
@@ -73,9 +82,15 @@ def train(args):
             progress_bar.set_description(
                 f"Epoch {epoch+1}/{args.epochs}, Loss: {loss.item():.4f}")
 
+        # Calculate average epoch loss
+        avg_epoch_loss = epoch_loss/len(train_dataloader)
+
+        # Update scheduler based on epoch loss
+        scheduler.step(avg_epoch_loss)
+
         # Print epoch stats
         print(
-            f"Epoch {epoch+1}/{args.epochs}, Avg Loss: {epoch_loss/len(train_dataloader):.4f}")
+            f"Epoch {epoch+1}/{args.epochs}, Avg Loss: {avg_epoch_loss:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
 
         # Save checkpoint
         if (epoch + 1) % args.save_every == 0:
@@ -84,6 +99,7 @@ def train(args):
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'loss': epoch_loss,
                 'schedule_type': args.schedule_type  # Save schedule type in checkpoint
             }, checkpoint_path)
@@ -110,13 +126,39 @@ def generate_samples(model, diffusion, device, epoch=None, n_samples=8, guidance
         import json
         object_dict = json.load(f)
 
+    # Create varied conditions to test color accuracy
+    conditions = []
+
+    # First add red sphere (existing test)
     red_sphere_idx = object_dict["red sphere"]
-    condition = torch.zeros(1, 24).to(device)
-    condition[0, red_sphere_idx] = 1
+    red_sphere_cond = torch.zeros(1, 24).to(device)
+    red_sphere_cond[0, red_sphere_idx] = 1
+    conditions.append(red_sphere_cond)
+
+    # Add blue cube
+    blue_cube_idx = object_dict["blue cube"]
+    blue_cube_cond = torch.zeros(1, 24).to(device)
+    blue_cube_cond[0, blue_cube_idx] = 1
+    conditions.append(blue_cube_cond)
+
+    # Add green cylinder
+    green_cyl_idx = object_dict["green cylinder"]
+    green_cyl_cond = torch.zeros(1, 24).to(device)
+    green_cyl_cond[0, green_cyl_idx] = 1
+    conditions.append(green_cyl_cond)
+
+    # Add yellow sphere
+    yellow_sphere_idx = object_dict["yellow sphere"]
+    yellow_sphere_cond = torch.zeros(1, 24).to(device)
+    yellow_sphere_cond[0, yellow_sphere_idx] = 1
+    conditions.append(yellow_sphere_cond)
+
+    # Concatenate all conditions
+    condition = torch.cat(conditions, dim=0)
 
     # Generate samples with increased steps and classifier-free guidance
     samples = diffusion.sample(
-        model, condition, n_samples=n_samples, n_steps=250, guidance_scale=guidance_scale)  # Increased steps and added guidance
+        model, condition, n_samples=n_samples//4, n_steps=250, guidance_scale=guidance_scale*1.2)  # Increased guidance for better color
 
     # Get final image and denormalize
     final_sample = samples[-1]
@@ -133,18 +175,20 @@ def generate_samples(model, diffusion, device, epoch=None, n_samples=8, guidance
     print(f"Samples saved to {save_path}")
 
 
-def load_model(checkpoint_path, device):
+def load_model(checkpoint_path, device, schedule_type=None):
     """Load model from checkpoint"""
     # Load checkpoint first to get schedule type if available
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     # Get schedule type from checkpoint or default to cosine
-    schedule_type = checkpoint.get('schedule_type', 'cosine')
-    print(f"Using {schedule_type} noise schedule from checkpoint")
+    checkpoint_schedule = checkpoint.get('schedule_type', 'cosine')
+    # If schedule_type is specified, it overrides the one in the checkpoint
+    model_schedule_type = schedule_type if schedule_type else checkpoint_schedule
+    print(f"Using {model_schedule_type} noise schedule")
 
     # Create model with correct schedule
     model, diffusion = create_diffusion_model(
-        device=device, schedule_type=schedule_type)
+        device=device, schedule_type=model_schedule_type)
 
     # Load model weights
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -181,13 +225,17 @@ def test(args):
     all_conditions = []
     progress_bar = tqdm(enumerate(test_dataloader), total=len(test_dataloader))
 
+    # Increased guidance scale for better color definition
+    guidance_scale = 4.5 if not hasattr(
+        args, 'guidance_scale') else args.guidance_scale
+
     for step, (images, labels) in progress_bar:
         labels = labels.to(device)
         batch_size = labels.shape[0]
 
-        # Generate samples with classifier-free guidance
+        # Generate samples with enhanced classifier-free guidance for better color
         samples = diffusion.sample(
-            model, labels, n_samples=1, n_steps=args.diffusion_steps, guidance_scale=3.0)
+            model, labels, n_samples=1, n_steps=args.diffusion_steps, guidance_scale=guidance_scale)
         final_samples = samples[-1]  # Get the last step samples
 
         # Move samples to the same device as the evaluator model (CUDA)

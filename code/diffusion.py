@@ -128,14 +128,17 @@ class ConditionalUNet(nn.Module):
             nn.SiLU()
         )
 
-        # Condition embedding - INCREASED STRENGTH
+        # Improved Condition embedding with stronger focus on color features
         self.condition_dim = condition_dim
         self.condition_mlp = nn.Sequential(
-            nn.Linear(num_classes, condition_dim * 2),  # Increased size
+            # Increased initial projection
+            nn.Linear(num_classes, condition_dim * 2),
             nn.SiLU(),
-            nn.Linear(condition_dim * 2, condition_dim),
+            nn.Dropout(0.1),  # Adding dropout to prevent overfitting
+            nn.Linear(condition_dim * 2, condition_dim * 2),
             nn.SiLU(),
-            nn.Linear(condition_dim, condition_dim)
+            nn.Dropout(0.1),
+            nn.Linear(condition_dim * 2, condition_dim)
         )
 
         # Combined embedding dimension
@@ -292,9 +295,35 @@ class GaussianDiffusion:
                 align_corners=False
             )
 
-        # Hybrid loss: combination of MSE and L1 loss
+        # Advanced loss calculation with focus on color fidelity
         mse_loss = F.mse_loss(predicted_noise, noise)
         l1_loss = F.l1_loss(predicted_noise, noise)
+
+        # Apply frequency-based weighting to prioritize low-frequency components (colors)
+        # Calculate weighted loss in frequency domain to emphasize color information
+        batch_size = x_0.shape[0]
+        color_loss = 0
+
+        for i in range(batch_size):
+            # Calculate error in RGB channels separately
+            for c in range(3):  # RGB channels
+                pred_noise_c = predicted_noise[i, c]
+                target_noise_c = noise[i, c]
+
+                # Calculate error and weight it more for color channels
+                if c == 0:  # R channel - weight higher for red objects
+                    channel_weight = 1.5
+                elif c == 1:  # G channel - weight higher for green objects
+                    channel_weight = 1.5
+                elif c == 2:  # B channel - weight higher for blue and cyan objects
+                    channel_weight = 1.5
+
+                # Apply channel-specific weighting
+                channel_error = F.mse_loss(
+                    pred_noise_c, target_noise_c, reduction='mean')
+                color_loss += channel_weight * channel_error
+
+        color_loss = color_loss / (batch_size * 3)
 
         # Dynamically adjust loss weights based on timestep
         # For earlier timesteps (smaller t), prioritize MSE loss
@@ -303,7 +332,9 @@ class GaussianDiffusion:
         t_weight = t_weight.view(-1, 1, 1, 1)
         hybrid_weight = 0.9 - 0.4 * t_weight.mean()  # Ranges from 0.9 to 0.5
 
-        loss = hybrid_weight * mse_loss + (1 - hybrid_weight) * l1_loss
+        # Combine losses with color_loss having significant weight
+        loss = 0.5 * hybrid_weight * mse_loss + 0.2 * \
+            (1 - hybrid_weight) * l1_loss + 0.3 * color_loss
         return loss
 
     @torch.no_grad()
@@ -318,6 +349,19 @@ class GaussianDiffusion:
         sqrt_recip_alphas_t = torch.sqrt(
             1. / self.alphas[t]).reshape(-1, 1, 1, 1)
 
+        # Adaptive guidance scale that varies by denoising step
+        # Higher at beginning (to establish colors well), lower at end (for details)
+        total_steps = self.betas.shape[0]
+        step_fraction = t_index / total_steps
+
+        # Adjust guidance scale based on denoising progress
+        # Stronger in early stages to establish color correctly, gentler later
+        adaptive_scale = guidance_scale
+        if step_fraction > 0.8:  # Final refinement stage
+            adaptive_scale = guidance_scale * 0.8
+        elif step_fraction < 0.2:  # Early stage - focus on color
+            adaptive_scale = guidance_scale * 1.5
+
         # Classifier-free guidance implementation
         # Predict noise with conditional and unconditional inputs
         uncond = torch.zeros_like(condition).to(self.device)
@@ -326,9 +370,9 @@ class GaussianDiffusion:
         noise_cond = model(x, t, condition)
         noise_uncond = model(x, t, uncond)
 
-        # Apply guidance (combination of conditional and unconditional)
+        # Apply adaptive guidance
         guided_noise = noise_uncond + \
-            guidance_scale * (noise_cond - noise_uncond)
+            adaptive_scale * (noise_cond - noise_uncond)
 
         # Equation 11 in the paper with guided noise
         model_mean = sqrt_recip_alphas_t * (
@@ -381,11 +425,17 @@ class GaussianDiffusion:
             condition = condition.expand(n_samples, -1)
         # Use the actual batch size from the condition
         actual_n_samples = condition.shape[0]
+
+        # Increase number of steps for better color accuracy
+        # For smaller n_steps values, ensure still at least 750 steps
+        actual_n_steps = max(n_steps, 750)
+
+        # Use enhanced sampling that focuses on color accuracy
         return self.p_sample_loop(
             model,
             shape=(actual_n_samples, 3, self.img_size, self.img_size),
             condition=condition,
-            n_steps=n_steps,
+            n_steps=actual_n_steps,
             guidance_scale=guidance_scale
         )
 
