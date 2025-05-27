@@ -2,6 +2,7 @@
 */__pycache__/
 */.pycache/
 *.pyc
+*.log
 
 # PyTorch
 *.pth
