@@ -10,4 +10,8 @@
 images/
 iclevr/
 
+# Logs
+code/wandb/
+code/checkpoints/
+
 *.pdf

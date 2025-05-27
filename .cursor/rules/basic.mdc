@@ -1,0 +1,9 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+- This is a python project that train a DDPM on iclevr dataset
+- This project use conda with env name 'llm'
+- Use the best performance methods
+- While improve the performance, don't create a new file named 'improve', instead just directly update the code.
