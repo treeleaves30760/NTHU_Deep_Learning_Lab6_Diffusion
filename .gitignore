@@ -14,5 +14,6 @@ iclevr/
 # Logs
 code/wandb/
 code/checkpoints/
+code/outputs/
 
 *.pdf

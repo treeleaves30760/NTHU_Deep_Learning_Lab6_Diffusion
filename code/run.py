@@ -49,7 +49,7 @@ class ExperimentRunner:
         })
         configs.append(config1)
 
-        # Experiment 2: Higher capacity model with linear schedule
+        # Experiment 2: Higher capacity model with cosine schedule
         config2 = base_config.copy()
         config2_name = 'exp2_cosine_large'
         config2.update({
