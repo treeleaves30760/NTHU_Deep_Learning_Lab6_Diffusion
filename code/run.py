@@ -40,9 +40,9 @@ class ExperimentRunner:
             'output_dir': './outputs/exp1_cosine_baseline',
             'wandb_run_name': 'exp1_cosine_baseline',
             'schedule_type': 'cosine',
-            'base_channels': 128,
+            'base_channels': 32,
             'learning_rate': 1e-4,
-            'batch_size': 16,
+            'batch_size': 8,
             'num_timesteps': 1000,
             'sample_freq': 20
         })
@@ -55,25 +55,25 @@ class ExperimentRunner:
             'output_dir': './outputs/exp2_cosine_large',
             'wandb_run_name': 'exp2_cosine_large',
             'schedule_type': 'cosine',
-            'base_channels': 256,
-            'learning_rate': 2.5e-5,
-            'batch_size': 16,
+            'base_channels': 64,
+            'learning_rate': 1e-4,
+            'batch_size': 4,
             'num_timesteps': 1000,
             'sample_freq': 20
         })
         configs.append(config2)
 
-        # Experiment 3: Fast training with fewer timesteps
+        # Experiment 3: Fast training
         config3 = base_config.copy()
         config3.update({
             'device': 'cuda:2',
             'output_dir': './outputs/exp3_fast_training',
             'wandb_run_name': 'exp3_fast_training',
             'schedule_type': 'cosine',
-            'base_channels': 96,
+            'base_channels': 16,
             'learning_rate': 1e-4,
-            'batch_size': 32,
-            'num_timesteps': 500,
+            'batch_size': 16,
+            'num_timesteps': 1000,
             'sample_freq': 20
         })
         configs.append(config3)
