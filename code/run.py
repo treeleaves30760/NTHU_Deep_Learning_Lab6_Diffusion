@@ -35,10 +35,11 @@ class ExperimentRunner:
 
         # Experiment 1: Baseline with cosine schedule
         config1 = base_config.copy()
+        config1_name = 'exp1_cosine_baseline'
         config1.update({
             'device': 'cuda:0',
-            'output_dir': './outputs/exp1_cosine_baseline',
-            'wandb_run_name': 'exp1_cosine_baseline',
+            'output_dir': f'./outputs/{config1_name}',
+            'wandb_run_name': config1_name,
             'schedule_type': 'cosine',
             'base_channels': 32,
             'learning_rate': 1e-4,
@@ -50,14 +51,15 @@ class ExperimentRunner:
 
         # Experiment 2: Higher capacity model with linear schedule
         config2 = base_config.copy()
+        config2_name = 'exp2_cosine_large'
         config2.update({
             'device': 'cuda:1',
-            'output_dir': './outputs/exp2_cosine_large',
-            'wandb_run_name': 'exp2_cosine_large',
+            'output_dir': f'./outputs/{config2_name}',
+            'wandb_run_name': config2_name,
             'schedule_type': 'cosine',
             'base_channels': 64,
             'learning_rate': 1e-4,
-            'batch_size': 4,
+            'batch_size': 8,
             'num_timesteps': 1000,
             'sample_freq': 20
         })
@@ -65,14 +67,15 @@ class ExperimentRunner:
 
         # Experiment 3: Fast training
         config3 = base_config.copy()
+        config3_name = 'exp3_cosine_fast'
         config3.update({
             'device': 'cuda:2',
-            'output_dir': './outputs/exp3_fast_training',
-            'wandb_run_name': 'exp3_fast_training',
+            'output_dir': f'./outputs/{config3_name}',
+            'wandb_run_name': config3_name,
             'schedule_type': 'cosine',
             'base_channels': 16,
             'learning_rate': 1e-4,
-            'batch_size': 16,
+            'batch_size': 8,
             'num_timesteps': 1000,
             'sample_freq': 20
         })
